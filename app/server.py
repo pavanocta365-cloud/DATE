@@ -23,6 +23,11 @@ def build_router() -> Router:
 
 SAFE_METHODS = ("GET", "HEAD")
 
+# Assets are served straight from disk and never read request.user, so they
+# skip the session lookup, the profile fetch and the two badge counts. A feed
+# page pulls ~20 avatars; without this each one paid for all four.
+SESSIONLESS_PREFIXES = ("/static/", "/avatar/", "/healthz")
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Nearby/%s" % "0.1"
@@ -74,7 +79,8 @@ class Handler(BaseHTTPRequestHandler):
         )
 
         try:
-            self._attach_session(request)
+            if not path.startswith(SESSIONLESS_PREFIXES):
+                self._attach_session(request)
             handler, params = router.resolve(method, path)
             if handler is None:
                 if params:  # matched a path but not this verb

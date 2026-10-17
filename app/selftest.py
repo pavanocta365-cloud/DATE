@@ -58,6 +58,18 @@ def _csrf(body):
     return m.group(1) if m else ""
 
 
+def _count_queries(fn):
+    """Statements this thread's connection runs while `fn` executes."""
+    conn = db.connect()
+    seen = []
+    conn.set_trace_callback(seen.append)
+    try:
+        fn()
+    finally:
+        conn.set_trace_callback(None)
+    return len(seen)
+
+
 PASSED, FAILED = [], []
 
 
@@ -303,6 +315,36 @@ def run() -> int:
         check("login succeeds with correct password", code == 303)
         code, body, _ = c2.get("/discover")
         check("logged back in", code == 200 and "Nearby" in body)
+
+        # --- query-count regressions -------------------------------------
+        # These guard the N+1 fixes: the counts must not scale with the
+        # number of rows on the page.
+        check("asset routes are exempt from session work",
+              all(p.startswith(server.SESSIONLESS_PREFIXES) for p in
+                  ("/static/styles.css", "/avatar/abc.svg", "/healthz")))
+        code, _, _ = c.get("/static/styles.css")
+        check("stylesheet still serves with no session", code == 200,
+              "status=%s" % code)
+
+        busy = db.query_one(
+            "SELECT user_a_id AS uid, COUNT(*) AS n FROM matches"
+            " GROUP BY user_a_id ORDER BY n DESC LIMIT 1")
+        if busy and busy["n"] >= 3:
+            n = busy["n"]
+            used = _count_queries(lambda: interactions.matches_for(busy["uid"]))
+            check("matches_for does not scale with match count", used <= 5,
+                  "%d matches cost %d queries" % (n, used))
+
+        admired = db.query_one(
+            "SELECT to_user_id AS uid, COUNT(*) AS n FROM likes"
+            " WHERE is_like = 1 GROUP BY to_user_id ORDER BY n DESC LIMIT 1")
+        if admired and admired["n"] >= 3:
+            n = admired["n"]
+            used = _count_queries(
+                lambda: interactions.likes_received(admired["uid"],
+                                                    pending_only=False))
+            check("likes_received does not scale with admirer count", used <= 8,
+                  "%d admirers cost %d queries" % (n, used))
 
         code, body, _ = c.get("/static/../schema.sql")
         check("static path traversal blocked", code in (403, 404))

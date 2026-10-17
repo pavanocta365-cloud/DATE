@@ -110,7 +110,14 @@ def likes_received(user_id: int, pending_only: bool = True) -> List[Dict]:
              ) if pending_only else ""
     params = (user_id, user_id) if pending_only else (user_id,)
     rows = db.query(_admirer_sql(extra), params)
-    return [_decorate(user_id, row) for row in rows]
+    if not rows:
+        return []
+    # Resolve the viewer once and every admirer's interests in one query,
+    # rather than re-reading both for each row.
+    viewer = _viewer_context(user_id)
+    by_profile = models.interest_names_for_profiles(
+        [r["profile_id"] for r in rows])
+    return [_decorate(user_id, row, viewer, by_profile) for row in rows]
 
 
 def pending_likes_count(user_id: int) -> int:
@@ -123,19 +130,38 @@ def pending_likes_count(user_id: int) -> int:
         (user_id, user_id)) or 0)
 
 
-def _decorate(viewer_id: int, row) -> Dict:
-    """Attach age, distance and shared interests to a person row."""
+def _viewer_context(viewer_id: int) -> Dict:
+    """The viewer's own location and interests - identical for every row."""
+    profile = models.profile_for_user(viewer_id)
+    return {
+        "location": models.current_location(viewer_id),
+        "interests": set(models.profile_interest_names(profile["id"]))
+                     if profile else set(),
+    }
+
+
+def _decorate(viewer_id: int, row, viewer: Optional[Dict] = None,
+              interests_by_profile: Optional[Dict] = None) -> Dict:
+    """Attach age, distance and shared interests to a person row.
+
+    `viewer` and `interests_by_profile` let a caller decorating a whole page
+    resolve both once up front; omitting them falls back to per-row lookups.
+    """
     from .geo import format_distance, haversine_km
-    me_profile = models.profile_for_user(viewer_id)
-    me_location = models.current_location(viewer_id)
+    if viewer is None:
+        viewer = _viewer_context(viewer_id)
+    me_location = viewer["location"]
 
     distance = None
     if me_location and row["latitude"] is not None:
         distance = haversine_km(me_location["latitude"], me_location["longitude"],
                                 row["latitude"], row["longitude"])
 
-    mine = set(models.profile_interest_names(me_profile["id"])) if me_profile else set()
-    theirs = models.profile_interest_names(row["profile_id"])
+    mine = viewer["interests"]
+    if interests_by_profile is None:
+        theirs = models.profile_interest_names(row["profile_id"])
+    else:
+        theirs = interests_by_profile.get(row["profile_id"], [])
     shared = sorted(mine & set(theirs))
 
     return {
@@ -158,38 +184,43 @@ def _decorate(viewer_id: int, row) -> Dict:
 
 # --- matches ---------------------------------------------------------------
 def matches_for(user_id: int) -> List[Dict]:
+    # One query for the lot. The profile join replaces a per-row lookup (and,
+    # being inner, drops matches whose profile has gone - what the old
+    # `if other is None: continue` did); the last message and unread count
+    # ride along as correlated subqueries against idx_messages_thread and
+    # idx_messages_unread.
     rows = db.query(
-        "SELECT m.id AS match_id, m.created_at,"
-        "       CASE WHEN m.user_a_id = ? THEN m.user_b_id ELSE m.user_a_id END"
-        "            AS other_id"
+        "SELECT m.id AS match_id, m.created_at, p.user_id AS other_id,"
+        "       p.display_name, p.birthdate, p.photo, p.headline,"
+        "       (SELECT body FROM messages x WHERE x.match_id = m.id"
+        "         ORDER BY x.id DESC LIMIT 1) AS last_message,"
+        "       (SELECT sender_id FROM messages x WHERE x.match_id = m.id"
+        "         ORDER BY x.id DESC LIMIT 1) AS last_sender_id,"
+        "       (SELECT created_at FROM messages x WHERE x.match_id = m.id"
+        "         ORDER BY x.id DESC LIMIT 1) AS last_at,"
+        "       (SELECT COUNT(*) FROM messages x WHERE x.match_id = m.id"
+        "         AND x.sender_id <> ? AND x.read_at IS NULL) AS unread"
         "  FROM matches m"
+        "  JOIN profiles p ON p.user_id ="
+        "       CASE WHEN m.user_a_id = ? THEN m.user_b_id ELSE m.user_a_id END"
         " WHERE m.user_a_id = ? OR m.user_b_id = ?"
         " ORDER BY m.created_at DESC, m.id DESC",
-        (user_id, user_id, user_id))
+        (user_id, user_id, user_id, user_id))
 
     out = []
     for row in rows:
-        other = models.profile_by_user_id(row["other_id"])
-        if other is None:
-            continue
-        last = db.query_one(
-            "SELECT body, sender_id, created_at FROM messages"
-            " WHERE match_id = ? ORDER BY id DESC LIMIT 1", (row["match_id"],))
-        unread = int(db.scalar(
-            "SELECT COUNT(*) FROM messages WHERE match_id = ? AND sender_id <> ?"
-            "   AND read_at IS NULL", (row["match_id"], user_id)) or 0)
         out.append({
             "match_id": row["match_id"],
             "created_at": row["created_at"],
             "user_id": row["other_id"],
-            "display_name": other["display_name"],
-            "age": models.age_from_birthdate(other["birthdate"]),
-            "photo": other["photo"],
-            "headline": other["headline"],
-            "last_message": last["body"] if last else None,
-            "last_sender_id": last["sender_id"] if last else None,
-            "last_at": last["created_at"] if last else None,
-            "unread": unread,
+            "display_name": row["display_name"],
+            "age": models.age_from_birthdate(row["birthdate"]),
+            "photo": row["photo"],
+            "headline": row["headline"],
+            "last_message": row["last_message"],
+            "last_sender_id": row["last_sender_id"],
+            "last_at": row["last_at"],
+            "unread": int(row["unread"] or 0),
         })
     # Most recently active conversations first; brand-new matches count as active.
     out.sort(key=lambda m: (m["last_at"] or m["created_at"]), reverse=True)
